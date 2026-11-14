@@ -2,7 +2,16 @@ name: Debug Windows Runner
 
 on:
   workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to checkout"
+        required: false
+        default: "main"
+        type: string
 
+# The first checkout persists GITHUB_TOKEN on the runner. We make its scope explicit
+# instead of depending on the repository default. Pushing to the target repository uses
+# FORK_TOKEN, not GITHUB_TOKEN, so read-only is enough here.
 permissions:
   contents: read
 
@@ -13,3 +22,116 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Extract environment files
+        shell: pwsh
+        run: |
+          Expand-Archive -Path ".\sample.zip" -DestinationPath ".\" -Force
+
+      - name: Setup MSVC dev cmd
+        uses: step-security/msvc-dev-cmd@22c98154b708dbd743e6f27a933cf6ceba3305c4  # v1.13.1
+
+      - name: Clone target repository
+        # [tool.uv.sources] in pyproject.toml declares:
+        #   pkg = { path = "src", editable = true }
+        # So uv sync installs the cloned repository as an editable package.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: ${{ secrets.TARGET_REPO }}
+          ref: ${{ inputs.branch }}
+          token: ${{ secrets.FORK_TOKEN }}
+          path: src
+
+      - name: Install git-secrets and register commit hooks
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # We use a fixed commit of awslabs/git-secrets. This avoids following changes in the main branch.
+          git clone --quiet https://github.com/awslabs/git-secrets.git "$RUNNER_TEMP/git-secrets-src"
+          git -C "$RUNNER_TEMP/git-secrets-src" checkout --quiet 7d6b970cbd3c216353cb22b383b70c150140662e
+
+          bin_dir="$RUNNER_TEMP/git-secrets-bin"
+          mkdir -p "$bin_dir"
+          cp "$RUNNER_TEMP/git-secrets-src/git-secrets" "$bin_dir/git-secrets"
+          cp "$RUNNER_TEMP/git-secrets-src/git-secrets.1" "$bin_dir/git-secrets.1"
+          chmod +x "$bin_dir/git-secrets"
+          # We add the bin directory to PATH so that later steps can run "git secrets".
+          # This includes hook execution at commit time.
+          echo "$bin_dir" >> "$GITHUB_PATH"
+
+          # GITHUB_PATH does not take effect in the current step. So we use the full path here.
+          cd src
+          "$bin_dir/git-secrets" --install
+          "$bin_dir/git-secrets" --register-aws
+
+          # --register-aws only covers AWS credential formats. We also register GitHub token
+          # formats, so that a token written to a file while debugging is rejected at commit time.
+          # The patterns are stored in src/.git/config, so they apply to the cloned repository only.
+          # Classic PAT / OAuth / user-to-server / server-to-server / refresh tokens (ghp_, gho_, ghu_, ghs_, ghr_).
+          "$bin_dir/git-secrets" --add 'gh[pousr]_[A-Za-z0-9]{36,}'
+          # Fine-grained personal access tokens.
+          "$bin_dir/git-secrets" --add 'github_pat_[A-Za-z0-9_]{22,}'
+
+      - name: Install uv
+        run: |
+          powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+      - name: Set up Python environment
+        run: |
+          uv python install 3.15
+          uv sync --python 3.15
+
+      - name: Setup sshd
+        shell: pwsh
+        run: |
+          Start-Service sshd
+          $f = 'C:\ProgramData\ssh\administrators_authorized_keys'
+          Set-Content -Path $f -Value '${{ secrets.SSH_PUBKEY }}' -Encoding ascii
+          icacls $f /inheritance:r /grant 'SYSTEM:F' /grant 'BUILTIN\Administrators:F'
+          Restart-Service sshd
+
+      # Accepted risks and why we consider them acceptable:
+      #   - The upterm connection string is printed in the public job log.
+      #     But access is limited by both limit-access-to-actor and sshd public
+      #     key authentication. So the string alone cannot be used to log in,
+      #     and it is only valid while this job is running.
+      #     We can treat it like a short-lived token.
+      - name: Setup Upterm session (SSH debug)
+        uses: owenthereal/action-upterm@6c2d60e09009f59cb4c45c88767c78701f14d121  # v2.8.1
+        with:
+          limit-access-to-actor: true
+          allow-forwarding: "loopback"
+
+      - name: Commit and push current changes
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          test -d src || exit 0
+          cd src
+
+          branch="bot_$(date +'%Y%m%d%H%M%S')"
+          git switch -c "$branch"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # We exclude files that may contain secrets from staging.
+          git add -A -- . \
+            ':(exclude,glob)**/.env' \
+            ':(exclude,glob)**/.env.*' \
+            ':(exclude,glob)**/*.pem' \
+            ':(exclude,glob)**/*.key' \
+            ':(exclude,glob)**/*.pfx' \
+            ':(exclude,glob)**/*.p12' \
+            ':(exclude,glob)**/*.ppk' \
+            ':(exclude,glob)**/id_*' \
+            ':(exclude,glob)**/.ssh/**'
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "changed"
+          git push -u origin "$branch"
